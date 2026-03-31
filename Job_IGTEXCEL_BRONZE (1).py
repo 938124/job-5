@@ -9,7 +9,8 @@ import re
 import os
 import pandas as pd
 import unicodedata
-
+from pyspark.sql.functions import sha2, concat_ws, col, coalesce, lit
+from delta.tables import DeltaTable
 from pyspark.sql import functions as F
 
 def clean_column_name(name: str) -> str:
@@ -275,7 +276,14 @@ try:
                     .withColumn("file_id", F.lit(file_id))
                     .withColumn("IS_DELETED", F.lit("false"))
                 )
+				exclude_cols = ["etl_id", "file_id", "IS_DELETED"]
 
+				hash_cols = sorted([c for c in data_df.columns if c not in exclude_cols])
+
+				data_df = data_df.withColumn(
+					"row_hash",
+					sha2(concat_ws("||", *[coalesce(col(c), lit("NULL")) for c in hash_cols]), 256)
+				)
                 table_exists = spark.catalog.tableExists(table_name)
                 if not table_exists and table_name not in created_tables:
                     (data_df.write.format("delta")
@@ -284,9 +292,27 @@ try:
                     )
                     created_tables.add(table_name)
                 else:
-                    if table_exists and table_name not in truncated_tables:
-                        spark.sql(f"TRUNCATE TABLE {table_name}")
-                        truncated_tables.add(table_name)
+					target_df = spark.table(table_name)
+				    if "row_hash" not in target_df.columns:
+						target_df = target_df.withColumn(
+							"row_hash",
+							sha2(concat_ws("||", *[coalesce(col(c), lit("NULL")) for c in hash_cols]), 256)
+						)
+						(target_df.write.format("delta")
+							.mode("overwrite")
+							.option("overwriteSchema", "true")
+							.saveAsTable(table_name)
+						)
+                    #if table_exists and table_name not in truncated_tables:
+                        #spark.sql(f"TRUNCATE TABLE {table_name}")
+                        #truncated_tables.add(table_name)
+					target = DeltaTable.forName(spark, table_name)
+					target.alias("t").merge(
+						data_df.alias("s"),
+						"t.row_hash = s.row_hash AND t.IS_DELETED = 'false'"
+					).whenNotMatchedBySourceUpdate(
+						set={"IS_DELETED": "'true'"}
+					).execute()	
                     incoming_view = f"_incoming_{uuid.uuid4().hex[:8]}"
                     data_df.createOrReplaceTempView(incoming_view)
                     col_list = ", ".join(data_df.columns)
@@ -352,47 +378,3 @@ try:
 except Exception as e:
     print(f"Pipeline execution failed: {e}")
     raise Exception(e)
-
-
-# COMMAND ----------
-
-# MAGIC
-# MAGIC %sql
-# MAGIC DROP TABLE IF EXISTS development_022_silver_finance.atlas_map.RPM_Performance_CDS_Class_II
-
-# COMMAND ----------
-
-# MAGIC %sql
-# MAGIC CREATE OR REPLACE VIEW development_022_silver_finance.atlas_stage.RPM_Performance_CDS_Class_II AS
-# MAGIC SELECT
-# MAGIC     `Install_At` AS install_at,
-# MAGIC     `Document_Num` AS document_num,
-# MAGIC     `Invoice_Date_From` AS invoice_date_from,
-# MAGIC     `Invoice_Date_To` AS invoice_date_to,
-# MAGIC     `Jurisdiction` AS jurisdiction,
-# MAGIC     `Mjpjur` AS mjpjur,
-# MAGIC     `Mjsegment` AS mjsegment,
-# MAGIC     `Install_At_Cust_Name` AS install_at_cust_name,
-# MAGIC     `Serial_Num` AS serial_num,
-# MAGIC     `Brand_Code` AS brand_code,
-# MAGIC     `Brand` AS brand,
-# MAGIC     `Theme_Code` AS theme_code,
-# MAGIC     `Theme` AS theme,
-# MAGIC     `Install_At_State` AS install_at_state,
-# MAGIC     `Aggregated_Amount_Wagered` AS aggregated_amount_wagered,
-# MAGIC     `Aggregated_Amount_Won` AS aggregated_amount_won,
-# MAGIC     `Gross_Win` AS gross_win,
-# MAGIC     `Aggregated_Machine_Days` AS aggregated_machine_days,
-# MAGIC     `Lease_Rate` AS lease_rate,
-# MAGIC     `Flat_Rate` AS flat_rate,
-# MAGIC     `Min_Per_Day` AS min_per_day,
-# MAGIC     `Casino_Split` AS casino_split,
-# MAGIC     `IGT_Split` AS igt_split,
-# MAGIC     `Total_Rev` AS total_rev,
-# MAGIC     `Total_Discount` AS total_discount,
-# MAGIC     `Net_Amount` AS net_amount,
-# MAGIC     `Concession_Amount` AS concession_amount,
-# MAGIC     `IS_DELETED` AS is_deleted
-# MAGIC FROM development_021_bronze_finance.atlas.RPM_Performance_CDS_Class_II
-# MAGIC WHERE IS_DELETED = false;
-# MAGIC
